@@ -75,6 +75,9 @@ extern void init_log_module(void);
 extern void show_version(const char *prog_name);
 extern void log_error(int loglevel, const char *fmt, ...);
 extern const char *jb_err_to_string(jb_err jb_error);
+#ifdef _WIN32
+extern char *w32_socket_strerr(int errcode, char *tmp_buf, size_t buffer_size);
+#endif
 
 #endif /* ndef ERRLOG_H_INCLUDED */
 
@@ -83,4 +86,3 @@ extern const char *jb_err_to_string(jb_err jb_error);
   tab-width: 3
   end:
 */
-

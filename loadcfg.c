@@ -98,6 +98,14 @@
  */
 #define DEFAULT_LISTEN_BACKLOG 128
 
+/*
+ * Default number of milliseconds to wait before starting
+ * a connection attempt to the next address of a host while
+ * previous attempts are still pending. The value is the one
+ * recommended by RFC 8305 (Happy Eyeballs Version 2).
+ */
+#define DEFAULT_CONNECT_ATTEMPT_DELAY 250
+
 #ifdef FEATURE_TOGGLE
 /* Privoxy is enabled by default. */
 int global_toggle_state = 1;
@@ -143,6 +151,7 @@ static struct file_list *current_configfile = NULL;
 #define hash_client_tag_lifetime         3239141416U /* "client-tag-lifetime" */
 #define hash_compression_level           2464423563U /* "compression-level" */
 #define hash_confdir                        1978389U /* "confdir" */
+#define hash_connect_attempt_delay       2712638590U /* "connect-attempt-delay" */
 #define hash_connection_sharing          1348841265U /* "connection-sharing" */
 #define hash_cors_allowed_origin         2769345637U /* "cors-allowed-origin" */
 #define hash_debug                            78263U /* "debug" */
@@ -759,6 +768,7 @@ struct configuration_spec * load_config(void)
     */
    config->max_client_connections    = 128;
    config->socket_timeout            = 300; /* XXX: Should be a macro. */
+   config->connect_attempt_delay     = DEFAULT_CONNECT_ATTEMPT_DELAY;
 #ifdef FEATURE_CONNECTION_KEEP_ALIVE
    config->default_server_timeout    = 0;
    config->keep_alive_timeout        = DEFAULT_KEEP_ALIVE_TIMEOUT;
@@ -999,6 +1009,24 @@ struct configuration_spec * load_config(void)
             break;
          }
 #endif
+
+/* *************************************************************************
+ * connect-attempt-delay number_of_milliseconds
+ * *************************************************************************/
+         case hash_connect_attempt_delay :
+         {
+            int connect_attempt_delay = parse_numeric_value(cmd, arg);
+            if (0 <= connect_attempt_delay)
+            {
+               config->connect_attempt_delay = connect_attempt_delay;
+            }
+            else
+            {
+               log_error(LOG_LEVEL_FATAL,
+                  "Invalid connect-attempt-delay: '%s'", arg);
+            }
+            break;
+         }
 
 /* *************************************************************************
  * connection-sharing (0|1)
