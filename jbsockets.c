@@ -72,6 +72,10 @@
 
 #endif
 
+/* For clock_gettime() and gettimeofday() */
+#include <time.h>
+#include <sys/time.h>
+
 #ifdef HAVE_POLL
 #ifdef __GLIBC__
 #include <sys/poll.h>
@@ -189,33 +193,586 @@ jb_socket connect_to(const char *host, int portnum, struct client_state *csp)
 }
 
 #ifdef HAVE_RFC2553
-/* Getaddrinfo implementation */
-static jb_socket rfc2553_connect_to(const char *host, int portnum, struct client_state *csp)
+
+/*
+ * Number of milliseconds after which a single connection
+ * attempt is considered to have failed.
+ */
+#define CONNECT_TIMEOUT_MSECS 30000
+
+#ifndef HAVE_POLL
+/* Only used as opaque pointer type if poll() isn't available. */
+struct pollfd;
+#endif
+
+/*
+ * Possible results of start_connection_attempt().
+ */
+enum connect_attempt_result
 {
-   struct addrinfo hints, *result, *rp;
-   char service[6];
-   int retval;
+   CONNECT_ATTEMPT_FAILED,
+   CONNECT_ATTEMPT_PENDING,
+   CONNECT_ATTEMPT_CONNECTED
+};
+
+/*
+ * State of a connection attempt to a single address.
+ *
+ * Used by rfc2553_connect_to() which may have several
+ * attempts in flight at the same time (RFC 8305).
+ */
+struct connect_attempt
+{
+   /** The address to connect to. */
+   const struct addrinfo *address;
+
+   /** The socket used for the attempt or JB_INVALID_SOCKET. */
    jb_socket fd;
+
+   /** Whether or not the attempt has been started but not completed yet. */
+   int pending;
+
+   /** Set by wait_for_connection_attempts() if the attempt completed. */
+   int ready;
+
+   /** The time at which the attempt was started. */
+   struct timeval start_time;
+
+#if !defined(_WIN32) && !defined(__BEOS__)
+   /** The file status flags of the socket before it was made non-blocking. */
+   int flags;
+#endif
+
+   /** Textual representation of the address. */
+   char ip_addr_str[NI_MAXHOST];
+};
+
+
+/*********************************************************************
+ *
+ * Function    :  get_monotonic_time
+ *
+ * Description :  Gets the current time for the purpose of measuring
+ *                time intervals. Uses a monotonic clock if available
+ *                so that the intervals aren't affected by changes
+ *                of the system time.
+ *
+ * Parameters  :
+ *          1  :  now = Receives the current time.
+ *
+ * Returns     :  N/A
+ *
+ *********************************************************************/
+static void get_monotonic_time(struct timeval *now)
+{
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+   struct timespec ts;
+
+   if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+   {
+      now->tv_sec = ts.tv_sec;
+      now->tv_usec = (suseconds_t)(ts.tv_nsec / 1000);
+      return;
+   }
+#endif
+   gettimeofday(now, NULL);
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  msecs_since
+ *
+ * Description :  Returns the number of milliseconds that have
+ *                passed since the given point in time.
+ *
+ * Parameters  :
+ *          1  :  start = The point in time to compare against.
+ *                        Has to come from get_monotonic_time().
+ *
+ * Returns     :  Number of milliseconds that passed since start.
+ *
+ *********************************************************************/
+static long msecs_since(const struct timeval *start)
+{
+   struct timeval now;
+
+   get_monotonic_time(&now);
+
+   return (now.tv_sec - start->tv_sec) * 1000
+      + (now.tv_usec - start->tv_usec) / 1000;
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  get_socket_error
+ *
+ * Description :  Returns the error code of the socket call that
+ *                just failed. On Windows the socket functions don't
+ *                set errno.
+ *
+ * Parameters  :  None
+ *
+ * Returns     :  The error code.
+ *
+ *********************************************************************/
+static int get_socket_error(void)
+{
+#ifdef _WIN32
+   return WSAGetLastError();
+#else
+   return errno;
+#endif
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  socket_strerror
+ *
+ * Description :  Returns a textual representation of an error
+ *                code returned by get_socket_error().
+ *
+ * Parameters  :
+ *          1  :  error = The error code.
+ *          2  :  buffer = Scratch space that may be used for the result.
+ *          3  :  buffer_size = Size of buffer in bytes.
+ *
+ * Returns     :  The error text, possibly stored in buffer.
+ *
+ *********************************************************************/
+#define SOCKET_STRERROR_BUFFER_SIZE 128
+static const char *socket_strerror(int error, char *buffer, size_t buffer_size)
+{
+#ifdef _WIN32
+   const char *text;
+   size_t length;
+
+   if (buffer_size == 0)
+   {
+      return "";
+   }
+   text = w32_socket_strerr(error, buffer, buffer_size);
+   if (text != buffer)
+   {
+      strlcpy(buffer, text, buffer_size);
+   }
+   /* Remove the trailing period so the text can be embedded in a sentence. */
+   length = strlen(buffer);
+   if ((length > 0) && (buffer[length - 1] == '.'))
+   {
+      buffer[length - 1] = '\0';
+   }
+   return buffer;
+#else
+   (void)buffer;
+   (void)buffer_size;
+   return strerror(error);
+#endif
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  set_socket_blocking_mode
+ *
+ * Description :  Switches a socket between blocking and
+ *                non-blocking mode.
+ *
+ * Parameters  :
+ *          1  :  attempt = The connection attempt whose socket
+ *                          to modify. Its flags member is used
+ *                          to remember the original mode.
+ *          2  :  blocking = TRUE to make the socket blocking,
+ *                           FALSE to make it non-blocking.
+ *
+ * Returns     :  N/A
+ *
+ *********************************************************************/
+static void set_socket_blocking_mode(struct connect_attempt *attempt,
+   int blocking)
+{
+#if defined(_WIN32)
+   u_long non_blocking = !blocking;
+
+   ioctlsocket(attempt->fd, FIONBIO, &non_blocking);
+#elif !defined(__BEOS__)
+   if (!blocking)
+   {
+      attempt->flags = fcntl(attempt->fd, F_GETFL, 0);
+      if (attempt->flags != -1)
+      {
+         fcntl(attempt->fd, F_SETFL, attempt->flags | O_NDELAY);
+      }
+   }
+   else if (attempt->flags != -1)
+   {
+      fcntl(attempt->fd, F_SETFL, attempt->flags);
+   }
+#else
+   (void)attempt;
+   (void)blocking;
+#endif
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  order_addresses
+ *
+ * Description :  Distributes the addresses returned by getaddrinfo()
+ *                to the connection attempts in the order the attempts
+ *                should be made.
+ *
+ *                As described in RFC 8305 section 4 the addresses
+ *                are sorted by alternating between address families,
+ *                starting with the family of the first address, which
+ *                is the family preferred by the resolver (RFC 6724).
+ *                The order of the addresses within a family is
+ *                preserved.
+ *
+ * Parameters  :
+ *          1  :  result = The list returned by getaddrinfo().
+ *          2  :  attempts = Array of connection attempts with
+ *                           room for attempt_count entries.
+ *          3  :  attempt_count = Maximum number of addresses to use.
+ *
+ * Returns     :  N/A
+ *
+ *********************************************************************/
+static void order_addresses(const struct addrinfo *result,
+   struct connect_attempt *attempts, int attempt_count)
+{
+   const struct addrinfo *first_family_address = result;
+   const struct addrinfo *other_family_address = result;
+   const int first_family = result->ai_family;
+   int count = 0;
+
+   while ((count < attempt_count)
+      && ((first_family_address != NULL) || (other_family_address != NULL)))
+   {
+      /* Skip the addresses that belong to the other family */
+      while ((first_family_address != NULL)
+         && (first_family_address->ai_family != first_family))
+      {
+         first_family_address = first_family_address->ai_next;
+      }
+      if (first_family_address != NULL)
+      {
+         attempts[count++].address = first_family_address;
+         first_family_address = first_family_address->ai_next;
+      }
+
+      /* Skip the addresses that belong to the first family */
+      while ((other_family_address != NULL)
+         && (other_family_address->ai_family == first_family))
+      {
+         other_family_address = other_family_address->ai_next;
+      }
+      if ((count < attempt_count) && (other_family_address != NULL))
+      {
+         attempts[count++].address = other_family_address;
+         other_family_address = other_family_address->ai_next;
+      }
+   }
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  start_connection_attempt
+ *
+ * Description :  Creates a socket and starts a non-blocking
+ *                connection attempt to the attempt's address.
+ *
+ * Parameters  :
+ *          1  :  csp = Current client state (buffers, headers, etc...)
+ *          2  :  attempt = The connection attempt to start.
+ *          3  :  socket_error = Receives the errno of the failure
+ *                               in case the attempt fails.
+ *
+ * Returns     :  CONNECT_ATTEMPT_CONNECTED if the connection was
+ *                established right away, CONNECT_ATTEMPT_PENDING
+ *                if the attempt is in progress or
+ *                CONNECT_ATTEMPT_FAILED if it failed.
+ *
+ *********************************************************************/
+static enum connect_attempt_result start_connection_attempt(
+   struct client_state *csp, struct connect_attempt *attempt,
+   int *socket_error)
+{
+   const struct addrinfo *rp = attempt->address;
+   jb_socket fd;
+   int retval;
+#ifdef FEATURE_ACL
+   struct access_control_addr dst[1];
+#endif /* def FEATURE_ACL */
+
+   retval = getnameinfo(rp->ai_addr, rp->ai_addrlen, attempt->ip_addr_str,
+      sizeof(attempt->ip_addr_str), NULL, 0, NI_NUMERICHOST);
+   if (retval)
+   {
+      log_error(LOG_LEVEL_ERROR,
+         "Failed to get the host name from the socket structure: %s",
+         gai_strerror(retval));
+      *socket_error = errno = EINVAL;
+      return CONNECT_ATTEMPT_FAILED;
+   }
+
+#ifdef FEATURE_ACL
+   memcpy(&dst->addr, rp->ai_addr, rp->ai_addrlen);
+#ifdef ACL_DEBUG
+   dst->addr_length = rp->ai_addrlen;
+#endif
+
+   if (block_acl(csp, dst))
+   {
+      *socket_error = errno = EPERM;
+      return CONNECT_ATTEMPT_FAILED;
+   }
+#endif /* def FEATURE_ACL */
+
+   fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+#ifdef _WIN32
+   if (fd == JB_INVALID_SOCKET)
+#else
+   if (fd < 0)
+#endif
+   {
+      *socket_error = get_socket_error();
+      return CONNECT_ATTEMPT_FAILED;
+   }
+
+#ifndef HAVE_POLL
+#ifndef _WIN32
+   if (fd >= FD_SETSIZE)
+   {
+      log_error(LOG_LEVEL_ERROR,
+         "Server socket number too high to use select(): %d >= %d",
+         fd, FD_SETSIZE);
+      close_socket(fd);
+      *socket_error = EMFILE;
+      return CONNECT_ATTEMPT_FAILED;
+   }
+#endif
+#endif
+
+#ifdef FEATURE_EXTERNAL_FILTERS
+   mark_socket_for_close_on_execute(fd);
+#endif
+
+   set_no_delay_flag(fd);
+
+   attempt->fd = fd;
+   set_socket_blocking_mode(attempt, FALSE);
+   get_monotonic_time(&attempt->start_time);
+
+   while (connect(fd, rp->ai_addr, rp->ai_addrlen) == JB_INVALID_SOCKET)
+   {
+      int error = get_socket_error();
+
+#ifdef _WIN32
+      if (error == WSAEWOULDBLOCK)
+#else /* ifndef _WIN32 */
+      if (error == EINPROGRESS)
+#endif /* ndef _WIN32 */
+      {
+         return CONNECT_ATTEMPT_PENDING;
+      }
+
+      if (error != EINTR)
+      {
+         *socket_error = error;
+         close_socket(fd);
+         attempt->fd = JB_INVALID_SOCKET;
+         return CONNECT_ATTEMPT_FAILED;
+      }
+   }
+
+   /*
+    * connect() succeeded right away. This is expected on platforms
+    * where the socket couldn't be made non-blocking and may also
+    * happen for local addresses.
+    */
+   return CONNECT_ATTEMPT_CONNECTED;
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  wait_for_connection_attempts
+ *
+ * Description :  Waits until at least one of the pending connection
+ *                attempts completes (successfully or not) or the
+ *                timeout expires. Completed attempts are marked as
+ *                ready.
+ *
+ * Parameters  :
+ *          1  :  attempts = Array of connection attempts.
+ *          2  :  attempt_count = Number of entries in the array.
+ *          3  :  timeout_msecs = Maximum number of milliseconds to wait.
+ *          4  :  poll_fds = Scratch space for poll() with room for
+ *                           attempt_count entries. Unused if poll()
+ *                           isn't available.
+ *
+ * Returns     :  Number of attempts that are ready, 0 in case
+ *                of a timeout or -1 on error with errno set.
+ *
+ *********************************************************************/
+static int wait_for_connection_attempts(struct connect_attempt *attempts,
+   int attempt_count, int timeout_msecs, struct pollfd *poll_fds)
+{
+   int i;
+   int ready_count = 0;
+   int retval;
 #ifdef HAVE_POLL
-   struct pollfd poll_fd[1];
+   int poll_fd_count = 0;
+
+   for (i = 0; i < attempt_count; i++)
+   {
+      attempts[i].ready = 0;
+      if (attempts[i].pending)
+      {
+         poll_fds[poll_fd_count].fd = attempts[i].fd;
+         poll_fds[poll_fd_count].events = POLLOUT;
+         poll_fd_count++;
+      }
+   }
+
+   retval = poll(poll_fds, (nfds_t)poll_fd_count, timeout_msecs);
+   if (retval > 0)
+   {
+      poll_fd_count = 0;
+      for (i = 0; i < attempt_count; i++)
+      {
+         if (attempts[i].pending)
+         {
+            /*
+             * Any event means the attempt completed, whether or not
+             * it succeeded is determined through SO_ERROR by the caller.
+             */
+            if (poll_fds[poll_fd_count].revents != 0)
+            {
+               attempts[i].ready = 1;
+               ready_count++;
+            }
+            poll_fd_count++;
+         }
+      }
+   }
 #else
    fd_set wfds;
+   fd_set efds;
    struct timeval timeout;
-#endif
-#if !defined(_WIN32) && !defined(__BEOS__)
-   int   flags;
-#endif
-   int connect_failed;
+   jb_socket max_fd = 0;
+
+   /*
+    * A completed attempt makes the socket writable, except on
+    * Windows where a failed attempt is reported through the
+    * exception set instead.
+    */
+   FD_ZERO(&wfds);
+   FD_ZERO(&efds);
+   for (i = 0; i < attempt_count; i++)
+   {
+      attempts[i].ready = 0;
+      if (attempts[i].pending)
+      {
+         FD_SET(attempts[i].fd, &wfds);
+         FD_SET(attempts[i].fd, &efds);
+         if (attempts[i].fd > max_fd)
+         {
+            max_fd = attempts[i].fd;
+         }
+      }
+   }
+
+   timeout.tv_sec  = timeout_msecs / 1000;
+   timeout.tv_usec = (timeout_msecs % 1000) * 1000;
+
+   /* MS Windows uses int, not SOCKET, for the 1st arg of select(). Weird! */
+   retval = select((int)max_fd + 1, NULL, &wfds, &efds, &timeout);
+   if (retval > 0)
+   {
+      for (i = 0; i < attempt_count; i++)
+      {
+         if (attempts[i].pending
+            && (FD_ISSET(attempts[i].fd, &wfds) || FD_ISSET(attempts[i].fd, &efds)))
+         {
+            attempts[i].ready = 1;
+            ready_count++;
+         }
+      }
+   }
+#endif /* def HAVE_POLL */
+
+   if (retval < 0)
+   {
+      return -1;
+   }
+
+   return ready_count;
+}
+
+
+/*********************************************************************
+ *
+ * Function    :  rfc2553_connect_to
+ *
+ * Description :  Resolves the host and connects to one of its
+ *                addresses using getaddrinfo().
+ *
+ *                Implements the connection part of Happy Eyeballs
+ *                (RFC 8305): the first connection attempt is started
+ *                right away, additional attempts to the remaining
+ *                addresses are started as soon as a previous attempt
+ *                failed or the connect-attempt-delay expired while
+ *                previous attempts are still pending. The first
+ *                attempt to succeed wins and the others are aborted.
+ *
+ *                As getaddrinfo() is synchronous and returns the
+ *                addresses of all families at once, the "Resolution
+ *                Delay" part of RFC 8305 doesn't apply.
+ *
+ * Parameters  :
+ *          1  :  host = hostname to connect to
+ *          2  :  portnum = port to connect to
+ *          3  :  csp = Current client state (buffers, headers, etc...)
+ *
+ * Returns     :  JB_INVALID_SOCKET => failure, else it is the socket
+ *                file descriptor.
+ *
+ *********************************************************************/
+static jb_socket rfc2553_connect_to(const char *host, int portnum, struct client_state *csp)
+{
+   struct addrinfo hints;
+   struct addrinfo *result;
+   const struct addrinfo *rp;
+   struct connect_attempt *attempts;
+   struct connect_attempt *attempt;
+   const struct connect_attempt *last_attempt = NULL;
+   const struct connect_attempt *failed_attempt = NULL;
+   struct connect_attempt *winner = NULL;
+   struct pollfd *poll_fds = NULL;
+   const int connect_attempt_delay = csp->config->connect_attempt_delay;
+   char service[6];
+   char error_buffer[SOCKET_STRERROR_BUFFER_SIZE];
+   int retval;
+   jb_socket fd = JB_INVALID_SOCKET;
+   int address_count = 0;
+   int attempt_count = 0;
+   int pending_count = 0;
+   int start_next_attempt = 1;
+   long timeout_msecs;
+   long remaining_msecs;
+   int i;
    /*
     * XXX: Initializing it here is only necessary
     *      because not all situations are properly
     *      covered yet.
     */
    int socket_error = 0;
-
-#ifdef FEATURE_ACL
-   struct access_control_addr dst[1];
-#endif /* def FEATURE_ACL */
 
    /* Don't leak memory when retrying. */
    freez(csp->error_message);
@@ -252,181 +809,230 @@ static jb_socket rfc2553_connect_to(const char *host, int portnum, struct client
 
    csp->http->host_ip_addr_str = zalloc_or_die(NI_MAXHOST);
 
-   for (rp = result; rp != NULL; rp = rp->ai_next)
+   /*
+    * Cap the number of addresses to the capacity of select()'s fd_sets
+    * for the unlikely event we get more addresses than the capacity
+    * (64 on Windows, typically 1024 or more on POSIX).
+    */
+   for (rp = result; (rp != NULL) && (address_count < FD_SETSIZE);
+      rp = rp->ai_next)
    {
-
-#ifdef FEATURE_ACL
-      memcpy(&dst->addr, rp->ai_addr, rp->ai_addrlen);
-#ifdef ACL_DEBUG
-      dst->addr_length = rp->ai_addrlen;
-#endif
-
-      if (block_acl(csp, dst))
-      {
-         socket_error = errno = EPERM;
-         continue;
-      }
-#endif /* def FEATURE_ACL */
-
-      retval = getnameinfo(rp->ai_addr, rp->ai_addrlen,
-         csp->http->host_ip_addr_str, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
-      if (retval)
-      {
-         log_error(LOG_LEVEL_ERROR,
-            "Failed to get the host name from the socket structure: %s",
-            gai_strerror(retval));
-         continue;
-      }
-
-      fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-#ifdef _WIN32
-      if (fd == JB_INVALID_SOCKET)
-#else
-      if (fd < 0)
-#endif
-      {
-         continue;
-      }
-
-#ifndef HAVE_POLL
-#ifndef _WIN32
-      if (fd >= FD_SETSIZE)
-      {
-         log_error(LOG_LEVEL_ERROR,
-            "Server socket number too high to use select(): %d >= %d",
-            fd, FD_SETSIZE);
-         close_socket(fd);
-         freeaddrinfo(result);
-         return JB_INVALID_SOCKET;
-      }
-#endif
-#endif
-
-#ifdef FEATURE_EXTERNAL_FILTERS
-      mark_socket_for_close_on_execute(fd);
-#endif
-
-      set_no_delay_flag(fd);
-
-#if !defined(_WIN32) && !defined(__BEOS__)
-      if ((flags = fcntl(fd, F_GETFL, 0)) != -1)
-      {
-         flags |= O_NDELAY;
-         fcntl(fd, F_SETFL, flags);
-      }
-#endif /* !defined(_WIN32) && !defined(__BEOS__) */
-
-      connect_failed = 0;
-      while (connect(fd, rp->ai_addr, rp->ai_addrlen) == JB_INVALID_SOCKET)
-      {
-#ifdef _WIN32
-         if (errno == WSAEINPROGRESS)
-#else /* ifndef _WIN32 */
-         if (errno == EINPROGRESS)
-#endif /* ndef _WIN32 */
-         {
-            break;
-         }
-
-         if (errno != EINTR)
-         {
-            socket_error = errno;
-            close_socket(fd);
-            connect_failed = 1;
-            break;
-         }
-      }
-      if (connect_failed)
-      {
-         continue;
-      }
-
-#if !defined(_WIN32) && !defined(__BEOS__)
-      if (flags != -1)
-      {
-         flags &= ~O_NDELAY;
-         fcntl(fd, F_SETFL, flags);
-      }
-#endif /* !defined(_WIN32) && !defined(__BEOS__) */
-
+      address_count++;
+   }
+   attempts = zalloc_or_die((size_t)address_count * sizeof(*attempts));
 #ifdef HAVE_POLL
-      poll_fd[0].fd = fd;
-      poll_fd[0].events = POLLOUT;
+   poll_fds = zalloc_or_die((size_t)address_count * sizeof(*poll_fds));
+#endif
+   order_addresses(result, attempts, address_count);
+   for (i = 0; i < address_count; i++)
+   {
+      attempts[i].fd = JB_INVALID_SOCKET;
+   }
 
-      retval = poll(poll_fd, 1, 30000);
-      if (retval == 0)
+   while ((fd == JB_INVALID_SOCKET)
+      && ((pending_count > 0) || (attempt_count < address_count)))
+   {
+      /*
+       * Start the next attempt if there's nothing else to wait for,
+       * a previous attempt just failed or the connect-attempt-delay
+       * expired since the last attempt was started.
+       */
+      if ((attempt_count < address_count)
+         && (start_next_attempt || (pending_count == 0)
+            || ((connect_attempt_delay > 0)
+               && (msecs_since(&last_attempt->start_time)
+                  >= connect_attempt_delay))))
       {
-         if (rp->ai_next != NULL)
+         attempt = &attempts[attempt_count++];
+         last_attempt = attempt;
+         start_next_attempt = 0;
+
+         switch (start_connection_attempt(csp, attempt, &socket_error))
          {
-            /* Log this now as we'll try another address next */
-            log_error(LOG_LEVEL_CONNECT,
-               "Could not connect to [%s]:%s: Operation timed out.",
-               csp->http->host_ip_addr_str, service);
+            case CONNECT_ATTEMPT_CONNECTED:
+               fd = attempt->fd;
+               winner = attempt;
+               break;
+            case CONNECT_ATTEMPT_PENDING:
+               if (pending_count > 0)
+               {
+                  log_error(LOG_LEVEL_CONNECT,
+                     "Connecting to %s[%s]:%s while %d earlier "
+                     "connection attempt(s) are still pending.",
+                     host, attempt->ip_addr_str, service, pending_count);
+               }
+               attempt->pending = 1;
+               pending_count++;
+               break;
+            case CONNECT_ATTEMPT_FAILED:
+            default:
+               failed_attempt = attempt;
+               if ((pending_count > 0) || (attempt_count < address_count))
+               {
+                  /*
+                   * Log this now as we'll try another address next.
+                   * If the last address fails, too, it will get logged
+                   * outside the loop body.
+                   */
+                  log_error(LOG_LEVEL_CONNECT,
+                     "Could not connect to %s[%s]:%s: %s.",
+                     host, attempt->ip_addr_str, service,
+                     socket_strerror(socket_error,
+                        error_buffer, sizeof(error_buffer)));
+               }
+               start_next_attempt = 1;
+               break;
          }
-         else
+         continue;
+      }
+
+      /*
+       * Wait for the pending attempts until one of them completes,
+       * the oldest one times out or it's time to start another one.
+       */
+      timeout_msecs = CONNECT_TIMEOUT_MSECS;
+      for (i = 0; i < attempt_count; i++)
+      {
+         if (attempts[i].pending)
          {
-            /*
-             * This is the last address, don't log this now
-             * as it would result in a duplicated log message.
-             */
-            socket_error = ETIMEDOUT;
+            remaining_msecs = CONNECT_TIMEOUT_MSECS
+               - msecs_since(&attempts[i].start_time);
+            if (remaining_msecs < timeout_msecs)
+            {
+               timeout_msecs = remaining_msecs;
+            }
          }
       }
-      else if (retval > 0)
-#else
-      /* wait for connection to complete */
-      FD_ZERO(&wfds);
-      FD_SET(fd, &wfds);
-
-      memset(&timeout, 0, sizeof(timeout));
-      timeout.tv_sec  = 30;
-
-      /* MS Windows uses int, not SOCKET, for the 1st arg of select(). Weird! */
-      if ((select((int)fd + 1, NULL, &wfds, NULL, &timeout) > 0)
-         && FD_ISSET(fd, &wfds))
-#endif
+      if ((connect_attempt_delay > 0) && (attempt_count < address_count))
       {
-         socklen_t optlen = sizeof(socket_error);
-         if (!getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &optlen))
+         remaining_msecs = connect_attempt_delay
+            - msecs_since(&last_attempt->start_time);
+         if (remaining_msecs < timeout_msecs)
          {
-            if (!socket_error)
+            timeout_msecs = remaining_msecs;
+         }
+      }
+      if (timeout_msecs < 0)
+      {
+         timeout_msecs = 0;
+      }
+
+      retval = wait_for_connection_attempts(attempts, attempt_count,
+         (int)timeout_msecs, poll_fds);
+      if (retval < 0)
+      {
+         socket_error = get_socket_error();
+         if (socket_error == EINTR)
+         {
+            continue;
+         }
+         log_error(LOG_LEVEL_ERROR, "Waiting for the connection "
+            "attempts to %s to complete failed: %E", host);
+         break;
+      }
+
+      /* Check which of the pending attempts completed or timed out */
+      for (i = 0; i < attempt_count; i++)
+      {
+         attempt = &attempts[i];
+         if (!attempt->pending)
+         {
+            continue;
+         }
+
+         if (attempt->ready)
+         {
+            int connection_error = 0;
+            socklen_t optlen = sizeof(connection_error);
+
+            if (getsockopt(attempt->fd, SOL_SOCKET, SO_ERROR,
+                  (char *)&connection_error, &optlen))
             {
-               /* Connection established, no need to try other addresses. */
+               connection_error = get_socket_error();
+               log_error(LOG_LEVEL_ERROR, "Could not get the state of "
+                  "the connection to %s[%s]:%s: %s; dropping connection.",
+                  host, attempt->ip_addr_str, service,
+                  socket_strerror(connection_error,
+                     error_buffer, sizeof(error_buffer)));
+            }
+            if (!connection_error)
+            {
+               /* Connection established, no need to wait for the others. */
+               fd = attempt->fd;
+               winner = attempt;
                break;
             }
-            if (rp->ai_next != NULL)
-            {
-               /*
-                * There's another address we can try, so log that this
-                * one didn't work out. If the last one fails, too,
-                * it will get logged outside the loop body so we don't
-                * have to mention it here.
-                */
-               log_error(LOG_LEVEL_CONNECT, "Could not connect to [%s]:%s: %s.",
-                  csp->http->host_ip_addr_str, service, strerror(socket_error));
-            }
+            socket_error = connection_error;
+         }
+         else if (msecs_since(&attempt->start_time) >= CONNECT_TIMEOUT_MSECS)
+         {
+#ifdef _WIN32
+            socket_error = WSAETIMEDOUT;
+#else
+            socket_error = ETIMEDOUT;
+#endif
          }
          else
          {
-            socket_error = errno;
-            log_error(LOG_LEVEL_ERROR, "Could not get the state of "
-               "the connection to [%s]:%s: %s; dropping connection.",
-               csp->http->host_ip_addr_str, service, strerror(errno));
+            /* Still pending */
+            continue;
          }
-      }
+         failed_attempt = attempt;
 
-      /* Connection failed, try next address */
-      close_socket(fd);
+         if ((pending_count > 1) || (attempt_count < address_count))
+         {
+            /*
+             * There's another address we can try, so log that this
+             * one didn't work out. If the last one fails, too,
+             * it will get logged outside the loop body so we don't
+             * have to mention it here.
+             */
+            log_error(LOG_LEVEL_CONNECT, "Could not connect to %s[%s]:%s: %s.",
+               host, attempt->ip_addr_str, service,
+               socket_strerror(socket_error, error_buffer, sizeof(error_buffer)));
+         }
+         close_socket(attempt->fd);
+         attempt->fd = JB_INVALID_SOCKET;
+         attempt->pending = 0;
+         pending_count--;
+         start_next_attempt = 1;
+      }
    }
 
-   freeaddrinfo(result);
-   if (!rp)
+   /* Abort the attempts that didn't win. */
+   for (i = 0; i < attempt_count; i++)
    {
-      log_error(LOG_LEVEL_CONNECT, "Could not connect to [%s]:%s: %s.",
-         host, service, strerror(socket_error));
-      csp->error_message = strdup(strerror(socket_error));
+      if ((attempts[i].fd != JB_INVALID_SOCKET) && (attempts[i].fd != fd))
+      {
+         log_error(LOG_LEVEL_CONNECT,
+            "Aborting the connection attempt to %s[%s]:%s.",
+            host, attempts[i].ip_addr_str, service);
+         close_socket(attempts[i].fd);
+      }
+   }
+   freeaddrinfo(result);
+   freez(poll_fds);
+
+   if (winner == NULL)
+   {
+      if (failed_attempt != NULL)
+      {
+         strlcpy(csp->http->host_ip_addr_str,
+            failed_attempt->ip_addr_str, NI_MAXHOST);
+      }
+      freez(attempts);
+      log_error(LOG_LEVEL_CONNECT, "Could not connect to %s[%s]:%s: %s.",
+         host, csp->http->host_ip_addr_str, service,
+         socket_strerror(socket_error, error_buffer, sizeof(error_buffer)));
+      csp->error_message = strdup(socket_strerror(socket_error,
+         error_buffer, sizeof(error_buffer)));
       return(JB_INVALID_SOCKET);
    }
+
+   set_socket_blocking_mode(winner, TRUE);
+   strlcpy(csp->http->host_ip_addr_str, winner->ip_addr_str, NI_MAXHOST);
+   freez(attempts);
+
    log_error(LOG_LEVEL_CONNECT, "Connected to %s[%s]:%s.",
       host, csp->http->host_ip_addr_str, service);
 

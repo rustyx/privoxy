@@ -87,9 +87,6 @@ static int debug = (LOG_LEVEL_FATAL | LOG_LEVEL_ERROR);
 
 /* static functions */
 static void fatal_error(const char *error_message);
-#ifdef _WIN32
-static char *w32_socket_strerr(int errcode, char *tmp_buf);
-#endif
 
 #ifdef MUTEX_LOCKS_AVAILABLE
 static void lock_logfile(void)
@@ -837,7 +834,7 @@ void log_error(int loglevel, const char *fmt, ...)
             /* Non-standard: Print error code from errno */
 #ifdef _WIN32
             ival = WSAGetLastError();
-            format_string = w32_socket_strerr(ival, tempbuf);
+            format_string = w32_socket_strerr(ival, tempbuf, sizeof(tempbuf));
 #else /* ifndef _WIN32 */
             ival = errno;
 #ifdef HAVE_STRERROR
@@ -982,13 +979,14 @@ const char *jb_err_to_string(jb_err jb_error)
  *          1  :  errcode = The return value from WSAGetLastError().
  *          2  :  tmp_buf = A temporary buffer that might be used to
  *                          store the string.
+ *          3  :  buffer_size = Size of tmp_buf in bytes.
  *
  * Returns     :  String representing the error code.  This may be
  *                a global string constant or a string stored in
  *                tmp_buf.
  *
  *********************************************************************/
-static char *w32_socket_strerr(int errcode, char *tmp_buf)
+char *w32_socket_strerr(int errcode, char *tmp_buf, size_t buffer_size)
 {
 #define TEXT_FOR_ERROR(code,text) \
    if (errcode == code)           \
@@ -1054,7 +1052,11 @@ static char *w32_socket_strerr(int errcode, char *tmp_buf)
     * TEXT_FOR_ERROR(WSA_OPERATION_ABORTED, "Overlapped operation aborted.");
     */
 
-   sprintf(tmp_buf, "(error number %d)", errcode);
+   if (buffer_size == 0)
+   {
+      return "";
+   }
+   snprintf(tmp_buf, buffer_size, "(error number %d)", errcode);
    return tmp_buf;
 }
 #endif /* def _WIN32 */

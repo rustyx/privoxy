@@ -782,6 +782,7 @@ AC_CHECK_FUNCS([ \
  gethostbyaddr_r \
  gethostbyname \
  gethostbyname_r \
+ clock_gettime \
  gettimeofday \
  inet_ntoa \
  memchr \

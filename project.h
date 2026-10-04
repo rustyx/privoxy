@@ -1582,6 +1582,14 @@ struct configuration_spec
    /* Timeout when waiting on sockets for data to become available. */
    int socket_timeout;
 
+   /*
+    * Number of milliseconds to wait before starting a connection
+    * attempt to the next address of a host while previous attempts
+    * are still pending (Happy Eyeballs, RFC 8305). 0 disables
+    * parallel connection attempts.
+    */
+   int connect_attempt_delay;
+
 #ifdef FEATURE_CONNECTION_KEEP_ALIVE
    /* Maximum number of seconds after which an open connection will no longer be reused. */
    unsigned int keep_alive_timeout;
